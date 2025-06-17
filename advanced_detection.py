@@ -5,10 +5,21 @@ from PIL import Image
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QWidget, QSlider, QMenuBar, QMenu, QAction, QFileDialog, QInputDialog,
-    QTabWidget, QSpinBox, QDoubleSpinBox, QGroupBox, QGridLayout
+    QTabWidget, QSpinBox, QDoubleSpinBox, QGroupBox, QGridLayout, QMessageBox
 )
 from PyQt5.QtCore import Qt, QTimer, QPoint
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QFont, QColor
+
+# MNIST 관련 import 추가
+try:
+    from sklearn.neighbors import KNeighborsClassifier
+    from sklearn.model_selection import train_test_split
+    from scipy.io import arff
+    import pandas as pd
+    MNIST_AVAILABLE = True
+except ImportError:
+    MNIST_AVAILABLE = False
+    print("MNIST 기능을 사용하려면 scikit-learn, scipy, pandas를 설치하세요.")
 
 # 클래스 이름 리스트
 CLASSES = ["background", "aeroplane", "bicycle", "bird", "boat",
@@ -36,6 +47,13 @@ class AdvancedDetectionApp(QMainWindow):
         self.draw_mode = None
         self.angle = 0
         self.confidence_threshold = 0.5
+
+        # MNIST 관련 변수 추가
+        self.knn_model = None
+        self.mnist_loaded = False
+        self.drawing_canvas = None
+        self.drawing_mode = False
+        self.drawing_thickness = 5
 
         # UI 설정
         self.setup_ui()
@@ -195,9 +213,313 @@ class AdvancedDetectionApp(QMainWindow):
         self.filter_layout.addLayout(filter_left, 2)
         self.filter_layout.addLayout(filter_right, 1)
 
+        # MNIST 숫자 인식 탭 추가
+        self.mnist_tab = QWidget()
+        self.mnist_layout = QHBoxLayout(self.mnist_tab)
+        
+        # 왼쪽 패널 (캔버스)
+        mnist_left = QVBoxLayout()
+        self.canvas_label = QLabel()
+        self.canvas_label.setMinimumSize(280, 280)
+        self.canvas_label.setMaximumSize(280, 280)
+        self.canvas_label.setStyleSheet("border: 2px solid black; background-color: white;")
+        self.canvas_label.mousePressEvent = self.canvas_mouse_press
+        self.canvas_label.mouseMoveEvent = self.canvas_mouse_move
+        self.canvas_label.mouseReleaseEvent = self.canvas_mouse_release
+        mnist_left.addWidget(self.canvas_label)
+        
+        # 캔버스 컨트롤 버튼
+        canvas_controls = QHBoxLayout()
+        self.clear_canvas_btn = QPushButton("지우기")
+        self.clear_canvas_btn.clicked.connect(self.clear_canvas)
+        self.predict_btn = QPushButton("예측")
+        self.predict_btn.clicked.connect(self.predict_digit)
+        canvas_controls.addWidget(self.clear_canvas_btn)
+        canvas_controls.addWidget(self.predict_btn)
+        mnist_left.addLayout(canvas_controls)
+        
+        # 선 굵기 슬라이더
+        self.thickness_slider = QSlider(Qt.Horizontal)
+        self.thickness_slider.setMinimum(1)
+        self.thickness_slider.setMaximum(20)
+        self.thickness_slider.setValue(5)
+        self.thickness_slider.valueChanged.connect(self.update_thickness)
+        mnist_left.addWidget(QLabel("선 굵기"))
+        mnist_left.addWidget(self.thickness_slider)
+        
+        # 오른쪽 패널 (MNIST 설정 및 결과)
+        mnist_right = QVBoxLayout()
+        
+        # MNIST 모델 그룹
+        mnist_group = QGroupBox("MNIST 모델")
+        mnist_settings = QVBoxLayout()
+        
+        self.load_mnist_btn = QPushButton("MNIST 데이터 로드 및 훈련")
+        self.load_mnist_btn.clicked.connect(self.load_and_train_mnist)
+        mnist_settings.addWidget(self.load_mnist_btn)
+        
+        self.mnist_status = QLabel("MNIST 모델이 로드되지 않았습니다.")
+        mnist_settings.addWidget(self.mnist_status)
+        
+        mnist_group.setLayout(mnist_settings)
+        mnist_right.addWidget(mnist_group)
+        
+        # 예측 결과 그룹
+        result_group = QGroupBox("예측 결과")
+        result_layout = QVBoxLayout()
+        self.prediction_result = QLabel("숫자를 그린 후 예측 버튼을 클릭하세요.")
+        self.prediction_result.setWordWrap(True)
+        self.prediction_result.setAlignment(Qt.AlignCenter)
+        
+        # 폰트 설정
+        font = QFont()
+        font.setPointSize(14)
+        font.setBold(True)
+        self.prediction_result.setFont(font)
+        
+        # 스타일 설정
+        self.prediction_result.setStyleSheet("""
+            QLabel {
+                background-color: #f0f0f0;
+                border: 2px solid #cccccc;
+                border-radius: 10px;
+                padding: 20px;
+                margin: 10px;
+            }
+        """)
+        
+        result_layout.addWidget(self.prediction_result)
+        result_group.setLayout(result_layout)
+        mnist_right.addWidget(result_group)
+        
+        mnist_right.addStretch()
+        
+        # 레이아웃 결합
+        self.mnist_layout.addLayout(mnist_left, 1)
+        self.mnist_layout.addLayout(mnist_right, 1)
+
         # 탭 추가
         self.tab_widget.addTab(self.detection_tab, "객체 인식")
         self.tab_widget.addTab(self.filter_tab, "이미지 필터링")
+        self.tab_widget.addTab(self.mnist_tab, "MNIST 숫자 인식")
+        
+        # 캔버스 초기화
+        self.init_canvas()
+
+    def init_canvas(self):
+        """캔버스를 초기화합니다."""
+        self.drawing_canvas = np.zeros((280, 280, 3), dtype=np.uint8)
+        self.drawing_canvas.fill(0)  # 검은색 배경
+        self.update_canvas_display()
+
+    def update_canvas_display(self):
+        """캔버스를 화면에 표시합니다."""
+        if self.drawing_canvas is not None:
+            h, w, ch = self.drawing_canvas.shape
+            bytes_per_line = ch * w
+            qt_image = QImage(self.drawing_canvas.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            self.canvas_label.setPixmap(QPixmap.fromImage(qt_image))
+
+    def canvas_mouse_press(self, event):
+        """캔버스에서 마우스 클릭 이벤트"""
+        if event.button() == Qt.LeftButton:
+            self.drawing_mode = True
+            self.last_point = (event.x(), event.y())
+
+    def canvas_mouse_move(self, event):
+        """캔버스에서 마우스 이동 이벤트"""
+        if self.drawing_mode and self.drawing_canvas is not None:
+            current_point = (event.x(), event.y())
+            cv2.line(self.drawing_canvas, self.last_point, current_point, (255, 255, 255), self.drawing_thickness)
+            self.last_point = current_point
+            self.update_canvas_display()
+
+    def canvas_mouse_release(self, event):
+        """캔버스에서 마우스 릴리즈 이벤트"""
+        if event.button() == Qt.LeftButton:
+            self.drawing_mode = False
+
+    def clear_canvas(self):
+        """캔버스를 지웁니다."""
+        self.init_canvas()
+        self.prediction_result.setText("숫자를 그린 후 예측 버튼을 클릭하세요.")
+
+    def update_thickness(self):
+        """선 굵기를 업데이트합니다."""
+        self.drawing_thickness = self.thickness_slider.value()
+
+    def load_and_train_mnist(self):
+        """MNIST 데이터를 로드하고 kNN 모델을 훈련합니다."""
+        if not MNIST_AVAILABLE:
+            QMessageBox.warning(self, "오류", "MNIST 기능을 사용하려면 scikit-learn, scipy, pandas를 설치하세요.")
+            return
+            
+        try:
+            self.mnist_status.setText("MNIST 데이터를 로드하고 훈련 중...")
+            QApplication.processEvents()  # UI 업데이트
+            
+            # MNIST 데이터 로드
+            data, meta = arff.loadarff('mnist_784.arff')
+            df = pd.DataFrame(data)
+            
+            # 데이터 준비
+            X = df.iloc[:, :-1].values  # 이미지 데이터 (784개 픽셀)
+            y = df.iloc[:, -1].values   # 레이블 (0-9)
+            
+            # 레이블을 정수형으로 변환
+            y = y.astype(int)
+            
+            # 데이터를 훈련/테스트로 분할
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+            
+            # kNN 모델 생성 및 훈련 (12번 파일과 동일)
+            self.knn_model = KNeighborsClassifier(n_neighbors=5)
+            self.knn_model.fit(X_train, y_train)
+            
+            # 모델 성능 평가
+            train_score = self.knn_model.score(X_train, y_train)
+            test_score = self.knn_model.score(X_test, y_test)
+            
+            self.mnist_loaded = True
+            self.mnist_status.setText(f"훈련 완료! (훈련: {train_score:.3f}, 테스트: {test_score:.3f})")
+            
+            QMessageBox.information(self, "완료", f"MNIST 모델 훈련이 완료되었습니다!\n훈련 정확도: {train_score:.3f}\n테스트 정확도: {test_score:.3f}")
+            
+        except FileNotFoundError:
+            QMessageBox.warning(self, "오류", "mnist_784.arff 파일을 찾을 수 없습니다.\n파일이 현재 디렉토리에 있는지 확인하세요.")
+            self.mnist_status.setText("MNIST 데이터 파일을 찾을 수 없습니다.")
+        except Exception as e:
+            QMessageBox.critical(self, "오류", f"MNIST 데이터 로드 중 오류가 발생했습니다:\n{str(e)}")
+            self.mnist_status.setText("MNIST 데이터 로드 실패")
+
+    def preprocess_drawn_image(self, drawn_image):
+        """마우스로 그린 이미지를 MNIST 스타일로 전처리"""
+        # 1. 그레이스케일 변환
+        gray = cv2.cvtColor(drawn_image, cv2.COLOR_BGR2GRAY)
+        
+        # 2. 이진화 (임계값을 50으로 설정 - 12번 파일과 동일)
+        _, binary = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY)
+        
+        # 3. 노이즈 제거
+        kernel = np.ones((3,3), np.uint8)
+        cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        
+        # 4. 28x28로 리사이즈
+        resized = cv2.resize(cleaned, (28, 28))
+        
+        # 5. 중앙 정렬
+        centered = self.center_digit(resized)
+        
+        return centered
+
+    def center_digit(self, image):
+        """숫자를 이미지 중앙에 정렬"""
+        coords = cv2.findNonZero(image)
+        if coords is not None and len(coords) > 0:
+            x, y, w, h = cv2.boundingRect(coords)
+            
+            # 숫자가 너무 작으면 중앙 정렬하지 않음 (12번 파일과 동일)
+            if w < 5 or h < 5:
+                return image
+            
+            # 중앙 계산
+            center_x = 14
+            center_y = 14
+            
+            # 이동 거리 계산
+            shift_x = center_x - (x + w // 2)
+            shift_y = center_y - (y + h // 2)
+            
+            # 이동 행렬 생성
+            M = np.float32([[1, 0, shift_x], [0, 1, shift_y]])
+            centered = cv2.warpAffine(image, M, (28, 28))
+            
+            return centered
+        return image
+
+    def predict_digit(self):
+        """그린 숫자를 예측합니다."""
+        if not self.mnist_loaded or self.knn_model is None:
+            QMessageBox.warning(self, "오류", "먼저 MNIST 모델을 로드하고 훈련하세요.")
+            return
+            
+        if self.drawing_canvas is None:
+            QMessageBox.warning(self, "오류", "캔버스가 초기화되지 않았습니다.")
+            return
+            
+        try:
+            # 현재 캔버스에서 이미지 전처리
+            processed = self.preprocess_drawn_image(self.drawing_canvas)
+            
+            # 전처리된 이미지를 1차원으로 변환
+            flattened = processed.flatten()
+            
+            # kNN으로 예측
+            prediction = self.knn_model.predict([flattened])[0]
+            confidence = self.knn_model.predict_proba([flattened])[0]
+            
+            # 상위 3개 예측 결과 표시
+            top_indices = np.argsort(confidence)[::-1][:3]
+            
+            # 결과 텍스트를 더 크고 명확하게 표시
+            result_text = f"🎯 예측 결과: {prediction}\n"
+            result_text += f"📊 신뢰도: {confidence[prediction]:.3f}\n\n"
+            result_text += "🏆 상위 3개 예측:\n"
+            for i, idx in enumerate(top_indices):
+                result_text += f"{i+1}. {idx}: {confidence[idx]:.3f}\n"
+            
+            self.prediction_result.setText(result_text)
+            
+            # 폰트 크기를 더 크게 설정
+            font = QFont()
+            font.setPointSize(16)
+            font.setBold(True)
+            self.prediction_result.setFont(font)
+            
+            # 예측 결과를 더 눈에 띄게 표시
+            if confidence[prediction] > 0.7:
+                self.prediction_result.setStyleSheet("""
+                    QLabel {
+                        background-color: #d4edda;
+                        border: 3px solid #28a745;
+                        border-radius: 10px;
+                        padding: 20px;
+                        margin: 10px;
+                        color: #155724;
+                        font-weight: bold;
+                    }
+                """)
+            elif confidence[prediction] > 0.4:
+                self.prediction_result.setStyleSheet("""
+                    QLabel {
+                        background-color: #fff3cd;
+                        border: 3px solid #ffc107;
+                        border-radius: 10px;
+                        padding: 20px;
+                        margin: 10px;
+                        color: #856404;
+                        font-weight: bold;
+                    }
+                """)
+            else:
+                self.prediction_result.setStyleSheet("""
+                    QLabel {
+                        background-color: #f8d7da;
+                        border: 3px solid #dc3545;
+                        border-radius: 10px;
+                        padding: 20px;
+                        margin: 10px;
+                        color: #721c24;
+                        font-weight: bold;
+                    }
+                """)
+            
+            print(f"예측 결과: {prediction}, 신뢰도: {confidence[prediction]:.3f}")
+            print(f"상위 3개: {top_indices}, 신뢰도: {confidence[top_indices]}")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "오류", f"예측 중 오류가 발생했습니다:\n{str(e)}")
+            print(f"예측 오류: {e}")
 
     def create_menu_bar(self):
         menubar = self.menuBar()
