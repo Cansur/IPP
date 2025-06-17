@@ -345,9 +345,10 @@ class AdvancedDetectionApp(QMainWindow):
         try:
             # 프레임 크기 조정
             frame = cv2.resize(frame, (640, 480))
+            # BGR에서 RGB로 변환하여 올바른 색상으로 표시
             self.current_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
-            # 객체 탐지
+            # 객체 탐지 (BGR 형식 사용)
             blob = cv2.dnn.blobFromImage(frame, 0.007843, (300, 300), 127.5)
             self.net.setInput(blob)
             detections = self.net.forward()
@@ -355,7 +356,7 @@ class AdvancedDetectionApp(QMainWindow):
             h, w = frame.shape[:2]
             detected_objects = []
 
-            # 탐지 결과 그리기
+            # 탐지 결과 그리기 (BGR 형식 사용)
             for i in range(min(detections.shape[2], 10)):
                 confidence = detections[0, 0, i, 2]
                 if confidence > self.confidence_threshold:
@@ -377,8 +378,9 @@ class AdvancedDetectionApp(QMainWindow):
             else:
                 self.detection_info.setText("탐지된 객체가 없습니다.")
 
-            # PyQt5 QLabel에 표시
-            self.display_image(frame, self.image_label)
+            # BGR에서 RGB로 변환하여 PyQt5 QLabel에 표시
+            display_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            self.display_image(display_frame, self.image_label)
             
         except Exception as e:
             print(f"프레임 처리 오류: {e}")
@@ -547,7 +549,9 @@ class AdvancedDetectionApp(QMainWindow):
         filename, _ = QFileDialog.getSaveFileName(self, "이미지 저장", "",
                                                 "PNG 이미지 (*.png);;JPEG 이미지 (*.jpg);;BMP 이미지 (*.bmp)")
         if filename:
-            cv2.imwrite(filename, cv2.cvtColor(self.filtered_frame, cv2.COLOR_RGB2BGR))
+            # RGB에서 BGR로 변환하여 저장
+            img_bgr = cv2.cvtColor(self.filtered_frame, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(filename, img_bgr)
 
     def apply_edge_filter(self):
         if self.current_frame is None:
